@@ -1,0 +1,16 @@
+import dotenv from 'dotenv';
+dotenv.config();
+
+export const CONFIG = {
+  TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN || 'YOUR_BOT_TOKEN',
+  TELEGRAM_CHAT_ID: process.env.TELEGRAM_CHAT_ID || 'YOUR_CHAT_ID',
+  SYMBOLS: ['BTCUSDT', 'ETHUSDT', 'SOLUSDT'],
+  INTERVAL: '15m',
+  EMA_PERIOD: 14,
+  SIGNAL_SMA_PERIOD: 9,
+  VOLUME_RATIO: 1.5,
+  MAX_ACTIVE_TRADES: 3,
+  RETEST_TOLERANCE: 0.001,
+  TP1_RR: 1.0,
+  TP2_RR: 2.5,
+};
