@@ -6,10 +6,13 @@ import { sendEntryAlert } from './telegram.js';
 import { info, warn, error, debug } from './logger.js';
 import { addTrade, getTrade, activeTrades, startMonitoring } from './tradeManager.js'; 
 import { checkAndNotifyBoot } from './bootNotifier.js';  
-// Tạo global cache
-global.klineCache = new Map();
 
-// Lấy nến cũ
+// Tạo global cache và lưu WebSocket instances
+global.klineCache = new Map();
+global.wsInstances = {};
+global.lastDataTime = {};
+
+// 🔧 SỬA LỖI: URL có khoảng trắng → 400 error
 async function fetchKlines(symbol) {
   const url = `https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${CONFIG.INTERVAL}&limit=100`;
   const res = await axios.get(url);
@@ -18,44 +21,80 @@ async function fetchKlines(symbol) {
     high: parseFloat(k[2]),
     low: parseFloat(k[3]),
     close: parseFloat(k[4]),
-    volume: parseFloat(k[5])
+    volume: parseFloat(k[5]),
+    timestamp: k[0]
   }));
 }
 
-// Khởi tạo
-async function init() {
-  info('🔄 Starting bot initialization...');
-  for (const symbol of CONFIG.SYMBOLS) {
-    try {
-      const klines = await fetchKlines(symbol);
-      global.klineCache.set(symbol, klines);
-      info(`✅ ${symbol}: Loaded ${klines.length} klines`, {
-        first: klines[0]?.close,
-        last: klines[klines.length-1]?.close,
-        volumeLast: klines[klines.length-1]?.volume
-      });
-    } catch (err) {
-      error(`❌ Failed to load klines for ${symbol}`, { error: err.message });
-    }
-  }
-  
-  info('⚙️ Bot config', {
-    symbols: CONFIG.SYMBOLS,
-    interval: CONFIG.INTERVAL,
-    maxActiveTrades: CONFIG.MAX_ACTIVE_TRADES
-  });
+// 🔄 KẾT NỐI WEBSOCKET CÓ RECONNECT
+function connectWithReconnect(symbol, maxRetries = 10) {
+  let reconnectCount = 0;
+  let shouldReconnect = true;
 
-  startMonitoring(); // ✅ Giờ đã được import đúng
-  info('🚀 Scalp Psychology Bot — Alert Only — started!');
+  const connect = () => {
+    if (!shouldReconnect) return;
+
+    const wsUrl = `wss://fstream.binance.com/ws/${symbol.toLowerCase()}@kline_15m`;
+    const ws = new WebSocket(wsUrl);
+    
+    ws.on('open', () => {
+      reconnectCount = 0;
+      info(`📡 WebSocket connected: ${symbol}`);
+    });
+
+    ws.on('close', () => {
+      warn(`🔌 WebSocket closed: ${symbol}`);
+      if (shouldReconnect && reconnectCount < maxRetries) {
+        const delay = Math.min(2000 * Math.pow(1.5, reconnectCount), 30000); // exponential backoff
+        warn(`⏳ Reconnecting ${symbol} in ${delay}ms... (attempt ${reconnectCount + 1})`);
+        setTimeout(() => {
+          reconnectCount++;
+          connect();
+        }, delay);
+      }
+    });
+
+    ws.on('error', (err) => {
+      error(`⚠️ WebSocket error: ${symbol}`, { error: err.message });
+      ws.close(); // force close để trigger reconnect
+    });
+
+    ws.on('message', (data) => {
+      try {
+        const msg = JSON.parse(data);
+        const k = msg.k;
+        onKline(symbol, {
+          open: parseFloat(k.o),
+          high: parseFloat(k.h),
+          low: parseFloat(k.l),
+          close: parseFloat(k.c),
+          volume: parseFloat(k.v),
+          timestamp: k.t,
+          isClosed: k.x
+        });
+      } catch (err) {
+        error(`💥 Parse error on ${symbol}`, { error: err.message });
+      }
+    });
+
+    global.wsInstances[symbol] = ws;
+  };
+
+  connect();
 }
 
 // Xử lý nến mới
 function onKline(symbol, kline) {
+  // 🩺 CẬP NHẬT THỜI GIAN NHẬN DATA GẦN NHẤT
+  if (kline.timestamp) {
+    global.lastDataTime[symbol] = kline.timestamp;
+  }
+
   const cache = global.klineCache.get(symbol);
   if (!cache) return;
 
   debug(`📥 ${symbol} kline`, {
-    time: new Date().toLocaleTimeString(),
+    time: new Date(kline.timestamp).toLocaleTimeString(),
     close: kline.close,
     volume: kline.volume,
     isClosed: kline.isClosed
@@ -96,39 +135,59 @@ function onKline(symbol, kline) {
   }
 }
 
-// WebSocket
-function connect(symbol) {
-  const ws = new WebSocket(`wss://fstream.binance.com/ws/${symbol.toLowerCase()}@kline_15m`);
-  
-  ws.on('open', () => info(`📡 WebSocket connected: ${symbol}`));
-  ws.on('close', () => warn(`🔌 WebSocket closed: ${symbol}`));
-  ws.on('error', (err) => error(`⚠️ WebSocket error: ${symbol}`, { error: err.message }));
-  
-  ws.on('message', (data) => {
-    try {
-//   console.log(`📡 Raw data from ${symbol}:`, data.toString().substring(0, 100) + '...');
+// 🩺 HEALTH CHECK: PHÁT HIỆN CHẾT LẶNG
+setInterval(() => {
+  const now = Date.now();
+  for (const symbol of CONFIG.SYMBOLS) {
+    const lastTime = global.lastDataTime[symbol] || 0;
+    const minutesSinceLast = (now - lastTime) / 60000;
+    
+    // M15 nên có data mỗi 15p → cảnh báo nếu >16p
+    if (minutesSinceLast > 16) {
+      warn(`🚨 ${symbol} no data for ${minutesSinceLast.toFixed(1)} minutes — force reconnect`);
+      try {
+        global.wsInstances[symbol]?.close();
+      } catch (err) {
+        error(`❌ Failed to close WS for ${symbol}`, { error: err.message });
+      }
+    }
+  }
+}, 60000); // kiểm tra mỗi phút
 
-      const msg = JSON.parse(data);
-      const k = msg.k;
-      onKline(symbol, {
-        open: parseFloat(k.o),
-        high: parseFloat(k.h),
-        low: parseFloat(k.l),
-        close: parseFloat(k.c),
-        volume: parseFloat(k.v),
-        isClosed: k.x
+// Khởi tạo
+async function init() {
+  info('🔄 Starting bot initialization...');
+  for (const symbol of CONFIG.SYMBOLS) {
+    try {
+      const klines = await fetchKlines(symbol);
+      global.klineCache.set(symbol, klines);
+      info(`✅ ${symbol}: Loaded ${klines.length} klines`, {
+        first: klines[0]?.close,
+        last: klines[klines.length-1]?.close,
+        volumeLast: klines[klines.length-1]?.volume
       });
     } catch (err) {
-      error(`💥 Parse error on ${symbol}`, { error: err.message });
+      error(`❌ Failed to load klines for ${symbol}`, { error: err.message });
     }
+  }
+  
+  info('⚙️ Bot config', {
+    symbols: CONFIG.SYMBOLS,
+    interval: CONFIG.INTERVAL,
+    maxActiveTrades: CONFIG.MAX_ACTIVE_TRADES
   });
+
+  startMonitoring();
+  info('🚀 Scalp Psychology Bot — Alert Only — started!');
 }
 
 // --- RUN ---
 (async () => {
   await init();
-  CONFIG.SYMBOLS.forEach(connect);
-   setTimeout(() => {
+  CONFIG.SYMBOLS.forEach(symbol => connectWithReconnect(symbol));
+  
+  // Gửi boot alert sau 3s
+  setTimeout(() => {
     checkAndNotifyBoot().catch(console.error);
   }, 3000);
 })();

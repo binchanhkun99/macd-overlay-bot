@@ -1,52 +1,61 @@
-// testTelegram.js
-import axios from 'axios';
-import { CONFIG } from './config.js';
+// fetch-btc-1m.js
+import https from 'https';
+import fs from 'fs'
+async function fetchBinance1mKlines() {
+  // Tính thời gian: 24h trước → hiện tại (UTC)
+  const now = Date.now();
+  const startTime = now - 12 * 60 * 60 * 1000; // 24h trước (ms)
+  const endTime = now;
 
-const { TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID } = CONFIG;
+  const url = `https://fapi.binance.com/fapi/v1/klines?` +
+    `symbol=BTCUSDT&` +
+    `interval=1m&` +
+    `startTime=${startTime}&` +
+    `endTime=${endTime}&` +
+    `limit=1500`; // max 1500 candles — đủ cho 24h (1440 candles)
 
-async function testTelegram() {
-  if (!TELEGRAM_BOT_TOKEN || TELEGRAM_BOT_TOKEN.includes('YOUR_BOT_TOKEN')) {
-    console.error('❌ TELEGRAM_BOT_TOKEN chưa được set hoặc vẫn là giá trị mặc định!');
-    return;
-  }
-
-  if (!TELEGRAM_CHAT_ID || TELEGRAM_CHAT_ID.includes('YOUR_CHAT_ID')) {
-    console.error('❌ TELEGRAM_CHAT_ID chưa được set hoặc vẫn là giá trị mặc định!');
-    return;
-  }
-
-  const message = `
- *TEST TELEGRAM NOTIFICATION*  
- Tét nô tì  
-⏰ Time: ${new Date().toLocaleString('vi-VN')}
-`.trim();
-
-  try {
-    const response = await axios.post(
-      `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
-      {
-        chat_id: TELEGRAM_CHAT_ID,
-        text: message,
-        parse_mode: 'MarkdownV2',
-        disable_web_page_preview: true,
-      }
-    );
-
-    if (response.data.ok) {
-      console.log('✅ Gửi test message thành công!');
-      console.log('Response:', response.data);
-    } else {
-      console.error('❌ Telegram trả về ok: false', response.data);
-    }
-  } catch (err) {
-    if (err.response) {
-      console.error(`❌ Lỗi HTTP ${err.response.status}: ${err.response.statusText}`);
-      console.error('Detail:', err.response.data);
-    } else {
-      console.error('❌ Lỗi gửi request:', err.message);
-    }
-  }
+  return new Promise((resolve, reject) => {
+    https.get(url, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        try {
+          const parsed = JSON.parse(data);
+          // Chuyển sang format gọn: [time, o, h, l, c, v]
+          const candles = parsed.map(c => [
+            parseInt(c[0]),     // openTime (ms)
+            parseFloat(c[1]),   // open
+            parseFloat(c[2]),   // high
+            parseFloat(c[3]),   // low
+            parseFloat(c[4]),   // close
+            parseFloat(c[5])    // volume
+          ]);
+          resolve(candles);
+        } catch (e) {
+          reject(new Error('JSON parse failed: ' + e.message));
+        }
+      });
+    }).on('error', reject);
+  });
 }
 
-// Chạy ngay khi file được execute
-testTelegram();
+// Chạy & ghi file
+fetchBinance1mKlines()
+  .then(candles => {
+    const output = {
+      symbol: 'BTCUSDT',
+      interval: '1m',
+      from: new Date(candles[0][0]).toISOString(),
+      to: new Date(candles[candles.length - 1][0]).toISOString(),
+      count: candles.length,
+      candles: candles
+    };
+    fs.writeFileSync('btc_1m_24h.json', JSON.stringify(output, null, 2));
+    console.log(`✅ Đã lưu ${candles.length} nến vào btc_1m_24h.json`);
+    console.log(`🕒 Từ: ${output.from} → ${output.to}`);
+    console.log(`💰 Giá hiện tại: $${candles[candles.length - 1][4].toFixed(2)}`);
+  })
+  .catch(err => {
+    console.error('❌ Lỗi:', err.message);
+    process.exit(1);
+  });
